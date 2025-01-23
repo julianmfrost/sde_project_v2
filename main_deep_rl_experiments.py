@@ -1,3 +1,5 @@
+#main_deep_rl_experiments.py
+
 import os
 import random
 import numpy as np
@@ -12,24 +14,6 @@ from deep_rl_agent import DeepRLAgent
 SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
-
-def run_tests(data, factors):
-    print("\nRunning preliminary tests...")
-    print("\n1. Testing DHR Model Updates...")
-    try:
-        factor = factors[0]
-        initial_data = data[factor].values[:24]
-        model = DHRModel(trend=True, seasonality=12)
-        model.build_model()
-        model.fit(initial_data)
-        initial_forecast = model.forecast(steps=1)
-        print(f"Initial forecast for {factor}: {initial_forecast}")
-        print("DHR model test passed")
-    except Exception as e:
-        print(f"DHR model test failed: {str(e)}")
-
-    print("\nPreliminary tests completed.")
-    return True
 
 def compute_metrics(portfolio_values, rf_values, periods_per_year=12):
     pv = np.array(portfolio_values)
@@ -55,12 +39,14 @@ def compute_metrics(portfolio_values, rf_values, periods_per_year=12):
 
 def run_experiment(no_plot=False):
     """
-    Runs one DHR+RL experiment, optionally suppressing plots if no_plot=True.
-    Returns a dictionary of performance metrics from the testing phase.
+    Runs one DHR+RL experiment, returning a dictionary that includes:
+    - Training RL and EW metrics
+    - Testing RL and EW metrics
+    If no_plot=True, it won't show any matplotlib plots.
     """
 
     try:
-        # Adjust path as needed:
+        # Adjust path if needed:
         data_file_path = r"/Users/julianfrost/Downloads/sde_project_v2-main/raw data/factors dataset final.csv"
         loader = FactorDataLoader(data_file_path)
         data = loader.load_data()
@@ -68,20 +54,20 @@ def run_experiment(no_plot=False):
 
         factors = ['SMB', 'HML', 'RMW', 'CMA']
 
+        # Preliminary test
         if not run_tests(data, factors):
-            # If preliminary tests fail, return empty or handle as you wish
             return {}
 
-        # Split data
+        # 80/20 split as an example
         split_index = int(len(data) * 0.8)
         training_data = data.iloc[:split_index].reset_index(drop=True)
         testing_data = data.iloc[split_index:].reset_index(drop=True)
 
         num_factors = len(factors)
         num_states = 6 ** num_factors  # Forecast(3) * Momentum(2) = 6 states per factor
-        num_actions = 3 ** num_factors  # 3 actions per factor
+        num_actions = 3 ** num_factors # 3 actions per factor
 
-        # Build DHR models for each factor
+        # ---- Build DHR models for each factor
         dhr_models = {}
         for factor in factors:
             y = training_data[factor].values
@@ -90,7 +76,7 @@ def run_experiment(no_plot=False):
             dhr.fit(y)
             dhr_models[factor] = dhr
 
-        # Prepare DHR forecasts for training
+        # ---- Prepare DHR forecasts (training)
         training_length = len(training_data)
         factor_forecasts_training = np.zeros((training_length, num_factors))
         for f_idx, factor in enumerate(factors):
@@ -103,7 +89,7 @@ def run_experiment(no_plot=False):
                 forecast_val = np.dot(model.kf.observation_matrices, next_state)[0]
                 factor_forecasts_training[t, f_idx] = forecast_val
 
-        # Prepare DHR forecasts for testing
+        # ---- Prepare DHR forecasts (testing)
         testing_length = len(testing_data)
         factor_forecasts_testing = np.zeros((testing_length, num_factors))
         for f_idx, factor in enumerate(factors):
@@ -120,16 +106,17 @@ def run_experiment(no_plot=False):
 
         train_factor_returns = training_data[factors].values
         test_factor_returns = testing_data[factors].values
-        rf = training_data['RF'].values
+        rf_train = training_data['RF'].values
         rf_test = testing_data['RF'].values
 
+        # Momentum signals (3-month)
         def compute_momentum_states(returns_array, window=3):
             T = returns_array.shape[0]
             momentum_states = np.zeros((T, num_factors), dtype=int)
             for t in range(T):
                 if t < window:
                     continue
-                sum_3 = np.sum(returns_array[t - window + 1 : t + 1, :], axis=0)
+                sum_3 = np.sum(returns_array[t-window+1:t+1, :], axis=0)
                 momentum_states[t, :] = (sum_3 > 0).astype(int)
             return momentum_states
 
@@ -144,9 +131,8 @@ def run_experiment(no_plot=False):
             else:
                 return 1
 
-        def factor_state_index(forecast_val, mom_val):
-            # forecast_val in {0,1,2}, mom_val in {0,1}
-            return forecast_val + 3 * mom_val
+        def factor_state_index(f_cast, m_val):
+            return f_cast + 3*m_val
 
         def state_to_index(factor_states):
             index = 0
@@ -161,7 +147,7 @@ def run_experiment(no_plot=False):
             temp = action_idx
             for _ in range(num_factors):
                 a = temp % 3
-                temp //= 3
+                temp //=3
                 changes.append(a)
             return changes
 
@@ -172,176 +158,209 @@ def run_experiment(no_plot=False):
         )
         action_effect = np.array([-0.1, 0.0, 0.1])
 
-        roll_window = 30
-        training_returns_deque = deque(maxlen=roll_window)
+        # ---- Training Phase
+        training_returns_deque = deque(maxlen=30)
+        rl_weights_train = np.ones(num_factors)/num_factors
+        rl_port_values_train = []
 
-        weight_array = np.ones(num_factors) / num_factors
-        portfolio_values = []
+        # Track eq-weight portfolio for training
+        eq_port_values_train = [1.0]  # start at 1
+        eq_cumprod = 1.0
 
-        # Factor BH / eq-weight for training (just for internal reference/plots)
-        train_factor_BH_values = np.ones((training_length, num_factors))
-        train_eq_weight_values = np.ones(training_length)
+        # We also store a parallel array of len(training_length)
+        eq_array_train = np.ones(training_length)
 
-        # ---- Training Loop ----
-        for t in range(training_length - 1):
+        for t in range(training_length-1):
+            # Build state
             factor_states = []
             for f_idx in range(num_factors):
-                f_cast = discretize_forecast(factor_forecasts_training[t, f_idx])
-                f_mom = momentum_training[t, f_idx]
-                f_state_idx = factor_state_index(f_cast, f_mom)
-                factor_states.append(f_state_idx)
+                f_val = discretize_forecast(factor_forecasts_training[t,f_idx])
+                m_val = momentum_training[t,f_idx]
+                factor_states.append(factor_state_index(f_val,m_val))
 
             state = state_to_index(factor_states)
             action_idx = agent.choose_action(state)
             action_decoded = action_idx_to_changes(action_idx)
 
-            # Adjust weights
-            for i, a_val in enumerate(action_decoded):
-                weight_array[i] += action_effect[a_val]
-            weight_array = np.clip(weight_array, 0, 1)
-            weight_array /= weight_array.sum()
+            # Adjust RL weights
+            for i,a_val in enumerate(action_decoded):
+                rl_weights_train[i] += action_effect[a_val]
+            rl_weights_train = np.clip(rl_weights_train,0,1)
+            rl_weights_train /= rl_weights_train.sum()
 
-            actual_returns = train_factor_returns[t + 1]
-            portfolio_return = np.sum(weight_array * actual_returns)
+            # RL portfolio return
+            actual_returns = train_factor_returns[t+1]
+            rl_ret = np.sum(rl_weights_train * actual_returns)
 
-            # BH updates (for reference)
-            for f_idx in range(num_factors):
-                train_factor_BH_values[t + 1, f_idx] = train_factor_BH_values[t, f_idx] * (1 + actual_returns[f_idx])
-            eq_weight_return = np.mean(actual_returns)
-            train_eq_weight_values[t + 1] = train_eq_weight_values[t] * (1 + eq_weight_return)
-
-            if t == 0:
-                portfolio_value = 1 + portfolio_return
+            if t==0:
+                rl_val = 1+rl_ret
             else:
-                portfolio_value = portfolio_values[-1] * (1 + portfolio_return)
-            portfolio_values.append(portfolio_value)
+                rl_val = rl_port_values_train[-1] * (1+rl_ret)
 
-            training_returns_deque.append(portfolio_return)
-            if len(training_returns_deque) == roll_window:
-                vol = np.std(training_returns_deque, ddof=1)
+            rl_port_values_train.append(rl_val)
+
+            # eq-weight for training
+            eq_ret_train = np.mean(actual_returns)
+            eq_cumprod *= (1 + eq_ret_train)
+            eq_array_train[t+1] = eq_cumprod
+
+            # Rolling vol for reward
+            training_returns_deque.append(rl_ret)
+            if len(training_returns_deque)==30:
+                vol = np.std(training_returns_deque,ddof=1)
             else:
-                vol = 0.0
+                vol=0.0
 
-            # Reward: RL port minus eq-weight minus volatility penalty
-            reward = (portfolio_return - eq_weight_return) - 0.01 * vol
+            # Reward
+            reward = (rl_ret - eq_ret_train) - 0.01*vol
 
             # Next state
-            if t + 1 < training_length - 1:
-                next_factor_states = []
+            if t+1 < training_length-1:
+                factor_states_next=[]
                 for f_idx in range(num_factors):
-                    f_cast_next = discretize_forecast(factor_forecasts_training[t + 1, f_idx])
-                    f_mom_next = momentum_training[t + 1, f_idx]
-                    next_factor_states.append(factor_state_index(f_cast_next, f_mom_next))
-                next_state = state_to_index(next_factor_states)
+                    f_val_next = discretize_forecast(factor_forecasts_training[t+1,f_idx])
+                    m_val_next = momentum_training[t+1,f_idx]
+                    factor_states_next.append(factor_state_index(f_val_next,m_val_next))
+                next_state = state_to_index(factor_states_next)
             else:
-                next_state = None
+                next_state=None
 
-            agent.update_q_table(state, action_idx, reward, next_state)
+            agent.update_q_table(state,action_idx,reward,next_state)
 
-        # Training Metrics
-        ann_ret_train, ann_vol_train, sh_ratio_train, mdd_train = compute_metrics(portfolio_values, rf[1:])
+        # Compute training stats
+        ann_ret_train_rl, ann_vol_train_rl, sh_train_rl, mdd_train_rl = compute_metrics(rl_port_values_train, rf_train[1:])
+        ann_ret_train_eq, ann_vol_train_eq, sh_train_eq, mdd_train_eq = compute_metrics(eq_array_train, rf_train)
 
-        if not no_plot:
-            print("\nTraining Period Performance Metrics:")
-            print(f"Annualized Return: {ann_ret_train:.2%}")
-            print(f"Annualized Volatility: {ann_vol_train:.2%}")
-            print(f"Sharpe Ratio: {sh_ratio_train:.2f}")
-            print(f"Max Drawdown: {mdd_train:.2%}")
-
-            # Plot training
-            plt.figure(figsize=(12, 6))
-            plt.plot(training_data['DATE'].iloc[1:], portfolio_values, label='DHR-RL Portfolio (Train)')
-            for f_idx, factor in enumerate(factors):
-                plt.plot(training_data['DATE'].iloc[1:], train_factor_BH_values[1:, f_idx], label=f"{factor} BH")
-            plt.plot(training_data['DATE'].iloc[1:], train_eq_weight_values[1:], label='Equal-Weighted BH', linestyle='--')
-            plt.title('Portfolio Value - Training')
-            plt.legend()
-            plt.show()
-
-        # ---- Testing Phase ----
+        # ---- Testing Phase
         agent.reset_exploration()
-        agent.exploration_rate = 0.01
+        agent.exploration_rate=0.01
 
-        test_portfolio_values = []
-        test_factor_BH_values = np.ones((testing_length, num_factors))
-        test_eq_weight_values = np.ones(testing_length)
-        test_returns_deque = deque(maxlen=roll_window)
+        rl_weights_test = np.ones(num_factors)/num_factors
+        rl_port_values_test=[]
+        eq_array_test= np.ones(testing_length)
+        eq_cumprod_test=1.0
 
-        test_weight_array = np.ones(num_factors) / num_factors
+        test_returns_deque=deque(maxlen=30)
 
-        for t in range(testing_length - 1):
-            test_factor_states = []
+        for t in range(testing_length-1):
+            factor_states_test=[]
             for f_idx in range(num_factors):
-                f_cast_test = discretize_forecast(factor_forecasts_testing[t, f_idx])
-                f_mom_test = momentum_testing[t, f_idx]
-                test_factor_states.append(factor_state_index(f_cast_test, f_mom_test))
+                f_val_test = discretize_forecast(factor_forecasts_testing[t,f_idx])
+                m_val_test = momentum_testing[t,f_idx]
+                factor_states_test.append(factor_state_index(f_val_test,m_val_test))
+            state_test = state_to_index(factor_states_test)
 
-            state_test = state_to_index(test_factor_states)
-            action_idx = agent.choose_action(state_test)
+            action_idx=agent.choose_action(state_test)
             action_decoded = action_idx_to_changes(action_idx)
 
-            for i, a_val in enumerate(action_decoded):
-                test_weight_array[i] += action_effect[a_val]
-            test_weight_array = np.clip(test_weight_array, 0, 1)
-            test_weight_array /= test_weight_array.sum()
+            for i,a_val in enumerate(action_decoded):
+                rl_weights_test[i]+=action_effect[a_val]
+            rl_weights_test = np.clip(rl_weights_test,0,1)
+            rl_weights_test/=rl_weights_test.sum()
 
-            actual_returns = test_factor_returns[t + 1]
-            portfolio_return = np.sum(test_weight_array * actual_returns)
+            actual_returns_test = test_factor_returns[t+1]
+            rl_ret_test = np.sum(rl_weights_test*actual_returns_test)
 
-            # BH updates (for reference)
-            for f_idx in range(num_factors):
-                test_factor_BH_values[t + 1, f_idx] = test_factor_BH_values[t, f_idx] * (1 + actual_returns[f_idx])
-            eq_weight_return_test = np.mean(actual_returns)
-            test_eq_weight_values[t + 1] = test_eq_weight_values[t] * (1 + eq_weight_return_test)
-
-            if t == 0:
-                portfolio_value_test = 1.0 * (1 + portfolio_return)
+            if t==0:
+                val_test = 1+rl_ret_test
             else:
-                portfolio_value_test = test_portfolio_values[-1] * (1 + portfolio_return)
-            test_portfolio_values.append(portfolio_value_test)
+                val_test= rl_port_values_test[-1]*(1+rl_ret_test)
+            rl_port_values_test.append(val_test)
 
-            test_returns_deque.append(portfolio_return)
+            # eq-weight
+            eq_ret_test = np.mean(actual_returns_test)
+            eq_cumprod_test *= (1 + eq_ret_test)
+            eq_array_test[t+1] = eq_cumprod_test
 
-        # Testing Metrics
-        ann_ret_test, ann_vol_test, sh_ratio_test, mdd_test = compute_metrics(test_portfolio_values, rf_test[1:])
+            test_returns_deque.append(rl_ret_test)
 
+        # final metrics
+        ann_ret_test_rl, ann_vol_test_rl, sh_test_rl, mdd_test_rl = compute_metrics(rl_port_values_test, rf_test[1:])
+        ann_ret_test_eq, ann_vol_test_eq, sh_test_eq, mdd_test_eq = compute_metrics(eq_array_test, rf_test)
+
+        # If no_plot=False, show training+testing charts, else skip
         if not no_plot:
-            print("\nTesting Period Performance Metrics:")
-            print(f"Annualized Return: {ann_ret_test:.2%}")
-            print(f"Annualized Volatility: {ann_vol_test:.2%}")
-            print(f"Sharpe Ratio: {sh_ratio_test:.2f}")
-            print(f"Max Drawdown: {mdd_test:.2%}")
+            # Print training metrics
+            print("\nTraining RL vs. EW:")
+            print(f"RL Annualized Return: {ann_ret_train_rl:.2%}, Sharpe: {sh_train_rl:.2f}, MaxDD: {mdd_train_rl:.2%}")
+            print(f"EW Annualized Return: {ann_ret_train_eq:.2%}, Sharpe: {sh_train_eq:.2f}, MaxDD: {mdd_train_eq:.2%}")
 
-            # Plot testing
-            plt.figure(figsize=(12, 6))
-            plt.plot(testing_data['DATE'].iloc[1:], test_portfolio_values, label='DHR-RL Portfolio (Test)')
-            for f_idx, factor in enumerate(factors):
-                plt.plot(testing_data['DATE'].iloc[1:], test_factor_BH_values[1:, f_idx], label=f"{factor} BH")
-            plt.plot(testing_data['DATE'].iloc[1:], test_eq_weight_values[1:], label='Equal-Weighted BH', linestyle='--')
-            plt.title('Portfolio Value - Testing')
+            plt.figure(figsize=(12,5))
+            plt.plot(rl_port_values_train, label='RL (Train)')
+            plt.plot(eq_array_train, label='EW (Train)')
+            plt.title("Training Comparison")
             plt.legend()
             plt.show()
 
-        # Return dictionary with final testing metrics
-        results_dict = {
-            "RL_AnnualizedReturn": ann_ret_test,
-            "RL_Volatility": ann_vol_test,
-            "RL_Sharpe": sh_ratio_test,
-            "RL_MaxDD": mdd_test
+            # Print testing metrics
+            print("\nTesting RL vs. EW:")
+            print(f"RL Annualized Return: {ann_ret_test_rl:.2%}, Sharpe: {sh_test_rl:.2f}, MaxDD: {mdd_test_rl:.2%}")
+            print(f"EW Annualized Return: {ann_ret_test_eq:.2%}, Sharpe: {sh_test_eq:.2f}, MaxDD: {mdd_test_eq:.2%}")
+
+            plt.figure(figsize=(12,5))
+            plt.plot(rl_port_values_test, label='RL (Test)')
+            plt.plot(eq_array_test, label='EW (Test)')
+            plt.title("Testing Comparison")
+            plt.legend()
+            plt.show()
+
+        # Return dictionary with both training & testing stats for RL & EW
+        return {
+            # Training RL
+            "Train_RL_AnnRet": ann_ret_train_rl,
+            "Train_RL_Vol": ann_vol_train_rl,
+            "Train_RL_Sharpe": sh_train_rl,
+            "Train_RL_MaxDD": mdd_train_rl,
+
+            # Training EW
+            "Train_EW_AnnRet": ann_ret_train_eq,
+            "Train_EW_Vol": ann_vol_train_eq,
+            "Train_EW_Sharpe": sh_train_eq,
+            "Train_EW_MaxDD": mdd_train_eq,
+
+            # Testing RL
+            "Test_RL_AnnRet": ann_ret_test_rl,
+            "Test_RL_Vol": ann_vol_test_rl,
+            "Test_RL_Sharpe": sh_test_rl,
+            "Test_RL_MaxDD": mdd_test_rl,
+
+            # Testing EW
+            "Test_EW_AnnRet": ann_ret_test_eq,
+            "Test_EW_Vol": ann_vol_test_eq,
+            "Test_EW_Sharpe": sh_test_eq,
+            "Test_EW_MaxDD": mdd_test_eq
         }
-        return results_dict
 
     except Exception as e:
-        print(f"An error occurred: {str(e)}")
+        print(f"Error in run_experiment: {str(e)}")
         return {}
 
+def run_tests(data, factors):
+    print("\nRunning preliminary tests...")
+    print("\n1. Testing DHR Model Updates...")
+    try:
+        factor = factors[0]
+        initial_data = data[factor].values[:24]
+        model = DHRModel(trend=True, seasonality=12)
+        model.build_model()
+        model.fit(initial_data)
+        initial_forecast = model.forecast(steps=1)
+        print(f"Initial forecast for {factor}: {initial_forecast}")
+        print("DHR model test passed")
+    except Exception as e:
+        print(f"DHR model test failed: {str(e)}")
+
+    print("\nPreliminary tests completed.")
+    return True
+
+
 def main():
-    # Single-run scenario (show plots)
-    res = run_experiment(no_plot=False)
-    if res:
+    # Single-run scenario with plots
+    results = run_experiment(no_plot=False)
+    if results:
         print("\nFinal Testing Metrics:")
-        for k,v in res.items():
-            print(f"{k}: {v}")
+        for k, v in results.items():
+            print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
 
 if __name__ == "__main__":
     main()

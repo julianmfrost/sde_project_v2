@@ -1,3 +1,5 @@
+#test loader
+
 from factor_loader import FactorDataLoader
 
 # Use a raw string to handle backslashes and enclose the path in triple quotes to handle spaces
